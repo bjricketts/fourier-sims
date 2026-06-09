@@ -376,62 +376,102 @@ def make_spectra(lc1, lc2, segment_size):
 # Models
 # =========================================================================
 
+def _opt(value, default):
+    """Return `value` if not None, else `default`. Lets each model define
+    its own paper-faithful defaults while CLI args still act as overrides."""
+    return value if value is not None else default
+
+
+def _dho_band(driver, t, dt, dho_specs, mean, frac, rng):
+    """Build a single light curve: mean + frac * sum(DHO responses) on a
+    shared driver, Poisson-sampled.
+
+    `dho_specs` is a list of (f0, zeta) pairs; their responses are summed
+    before injection so multiple peaks per band share the driver coherently.
+    The amplitude factor `frac` is applied relative to `driver.std()`, so
+    different-ζ DHOs on the same driver keep their relative amplitudes.
+    """
+    resp = sum(dho_filter(driver, dt, f0=f, zeta=z, gain=1.0)
+               for f, z in dho_specs)
+    amp = frac * mean / driver.std()
+    rate = np.clip(mean + amp * resp, 0, None)
+    return Lightcurve(t, rng.poisson(rate), dt=dt, skip_checks=True)
+
+
 # ---- 1. Differing damping ------------------------------------------------
 def model_damping(args) -> SimResult:
-    dt = args.dt
-    T = args.segment * 100
-    t = np.arange(-T, T, dt)
-    index = int(T / dt)
+    """Paper Fig. 1: one broadband driver into two DHOs at the *same*
+    resonant frequency but with different damping ratios."""
+    dt = 1 / 512
+    T_bins = int(1024 / dt)
+    driver, t = _build_broadband(dt, T_bins, seed=1)
 
-    x1 = make_decaying_sine(args.constant, 0.5, args.omega1, args.dampen1, 0, t)
-    x2 = make_decaying_sine(args.constant, 0.5, args.omega2, args.dampen2, 0, t)
-    lc1 = Lightcurve(t[index:], x1[index:])
-    lc2 = Lightcurve(t[index:], x2[index:])
+    f1 = _opt(args.omega1, 5.0)
+    f2 = _opt(args.omega2, 5.0)
+    z1 = _opt(args.dampen1, 0.05)     # Q = 10
+    z2 = _opt(args.dampen2, 0.15)     # Q ~ 3.3
+    mean = _opt(args.constant, 1e4)
+
+    rng = np.random.default_rng(11)
+    lc1 = _dho_band(driver, t, dt, [(f1, z1)], mean, frac=0.05, rng=rng)
+    lc2 = _dho_band(driver, t, dt, [(f2, z2)], mean, frac=0.05, rng=rng)
 
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
     return SimResult(lc1, lc2, ps1, ps2, cs,
-                     vlines=(args.omega1, args.omega2),
-                     t_lim=(t[index:].min(), t[index:].min() + 5),
-                     f_lim=(1, 20))
+                     vlines=(f1, f2), t_lim=(0, 5), f_lim=(0.5, 20))
 
 
-# ---- 2. Two coherent sine waves added together (dual signal) -------------
+# ---- 2. Two coherent peaks per band (dual-signal case) -------------------
 def model_coherent_sum(args) -> SimResult:
-    dt = args.dt
-    T = args.segment * 10
-    t = np.arange(0, T, dt)
-    C = args.constant
+    """Paper Fig. 2: each band is the sum of two DHO responses on a shared
+    driver. The low-frequency response is identical between bands; the
+    high-frequency one sits at slightly different center frequencies."""
+    dt = 1 / 512
+    T_bins = int(1024 / dt)
+    driver, t = _build_broadband(dt, T_bins, seed=1)
 
-    x1a = make_decaying_sine(C, 1.00, args.omega1, args.dampen1, 0, t)
-    x1b = make_decaying_sine(C, 1.00, args.omega2, args.dampen2, 0, t)
-    x2a = make_decaying_sine(C, 0.75, args.omega1, args.dampen1, 0, t)
-    x2b = make_decaying_sine(C, 1.00, args.omega3, args.dampen3, 0, t)
+    f_shared = _opt(args.omega1, 1.0)
+    f_sec_a  = _opt(args.omega2, 3.0)    # band 1's high-freq peak
+    f_sec_b  = _opt(args.omega3, 3.0)    # band 2's high-freq peak
+    z_shared = _opt(args.dampen1, 0.1)
+    z_sec_a  = _opt(args.dampen2, 0.1)
+    z_sec_b  = _opt(args.dampen3, 0.15)
+    mean = _opt(args.constant, 1e4)
 
-    lc1 = Lightcurve(t, x1a) + Lightcurve(t, x1b)
-    lc2 = Lightcurve(t, x2a) + Lightcurve(t, x2b)
-    lc1.counts = np.random.poisson(lc1.counts)
-    lc2.counts = np.random.poisson(lc2.counts)
+    rng = np.random.default_rng(11)
+    lc1 = _dho_band(driver, t, dt,
+                    [(f_shared, z_shared), (f_sec_a, z_sec_a)],
+                    mean, frac=0.05, rng=rng)
+    lc2 = _dho_band(driver, t, dt,
+                    [(f_shared, z_shared), (f_sec_b, z_sec_b)],
+                    mean, frac=0.05, rng=rng)
 
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
     return SimResult(lc1, lc2, ps1, ps2, cs,
-                     vlines=(args.omega1, args.omega2, args.omega3),
-                     t_lim=(0, 5), f_lim=(0.4, 12))
+                     vlines=(f_shared, f_sec_a, f_sec_b),
+                     t_lim=(0, 5), f_lim=(0.1, 12))
 
 
-# ---- 3. Different resonant frequencies (PLACEHOLDER) ---------------------
+# ---- 3. Different resonant frequencies -----------------------------------
 def model_resonance(args) -> SimResult:
-    print("[PLACEHOLDER] model_resonance: section 2.1.2 of the paper is empty. "
-          "Returning a trivial two-sine simulation as a stub.")
-    dt = args.dt
-    T = args.segment * 20
-    t = np.arange(0, T, dt)
-    x1 = make_decaying_sine(args.constant, 0.5, args.omega1, args.dampen1, 0, t)
-    x2 = make_decaying_sine(args.constant, 0.5, args.omega2, args.dampen1, 0, t)
-    lc1 = Lightcurve(t, np.random.poisson(np.clip(x1, 1, None)))
-    lc2 = Lightcurve(t, np.random.poisson(np.clip(x2, 1, None)))
+    """Paper Section 2.1.2 (no figure in the draft): one broadband driver
+    into two DHOs at different resonant frequencies, identical damping."""
+    dt = 1 / 512
+    T_bins = int(1024 / dt)
+    driver, t = _build_broadband(dt, T_bins, seed=1)
+
+    f1 = _opt(args.omega1, 5.0)
+    f2 = _opt(args.omega2, 6.0)
+    z = _opt(args.dampen1, 0.05)
+    mean = _opt(args.constant, 1e4)
+
+    rng = np.random.default_rng(11)
+    lc1 = _dho_band(driver, t, dt, [(f1, z)], mean, frac=0.05, rng=rng)
+    lc2 = _dho_band(driver, t, dt, [(f2, z)], mean, frac=0.05, rng=rng)
+
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
     return SimResult(lc1, lc2, ps1, ps2, cs,
-                     vlines=(args.omega1, args.omega2),
+                     vlines=(f1, f2),
                      t_lim=(0, 5), f_lim=(0.5, 20))
 
 
@@ -728,13 +768,13 @@ def model_envelope_qpo(args) -> SimResult:
     t = np.arange(0, T, dt)
     env = np.exp(-((t - T / 2) ** 2) / (2 * (T / 8) ** 2))
     base, _, _ = timmer_koenig_single(t, mean=500, dt=dt,
-                                      omega=args.omega1, q=10, rms=0.5)
+                                      omega=_opt(args.omega1, 1.5), q=10, rms=0.5)
     sig = base.counts * env
     lc1 = Lightcurve(t, sig + 100)
     lc2 = Lightcurve(t, sig * 0.9 + 100)
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
     return SimResult(lc1, lc2, ps1, ps2, cs,
-                     vlines=(args.omega1,),
+                     vlines=(_opt(args.omega1, 1.5),),
                      t_lim=(0, T), f_lim=(1 / args.segment, 20))
 
 
@@ -759,27 +799,6 @@ def _tf_driven(tf_func, tf_kwargs, args) -> SimResult:
                      label1="input", label2="output")
 
 
-def model_allpass(args) -> SimResult:
-    return _tf_driven(allpass_tf,
-                      {"omega_z": args.omega_z, "gamma_z": args.gamma_z},
-                      args)
-
-
-def model_echo(args) -> SimResult:
-    return _tf_driven(echo_tf,
-                      {"alpha": args.alpha, "tau": args.tau},
-                      args)
-
-
-def model_coupled(args) -> SimResult:
-    return _tf_driven(
-        coupled_oscillators_tf,
-        {"omega1": args.omega1, "gamma1": args.gamma1,
-         "omega2": args.omega2, "gamma2": args.gamma2,
-         "kappa": args.kappa, "zero_type": args.zero_type},
-        args)
-
-
 # =========================================================================
 # CLI
 # =========================================================================
@@ -795,9 +814,6 @@ MODELS: dict[str, Callable[[argparse.Namespace], SimResult]] = {
     "fm":                   model_fm,
     "count_rate_fm":        model_count_rate_fm,
     "envelope_qpo":         model_envelope_qpo,
-    "allpass":              model_allpass,
-    "echo":                 model_echo,
-    "coupled":              model_coupled,
 }
 
 
@@ -819,16 +835,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Sample spacing in seconds (default 1/512).")
     p.add_argument("--segment", type=int, default=16,
                    help="Segment size for averaging (s, default 16).")
-    p.add_argument("--constant", type=float, default=10000.0,
-                   help="DC level for sine-wave models.")
-
-    # Frequencies / damping (used by several models)
-    p.add_argument("--omega1", type=float, default=5.0)
-    p.add_argument("--omega2", type=float, default=5.0)
-    p.add_argument("--omega3", type=float, default=2.7)
-    p.add_argument("--dampen1", type=float, default=0.125)
-    p.add_argument("--dampen2", type=float, default=0.25)
-    p.add_argument("--dampen3", type=float, default=1.0)
+    # Frequencies / damping (used by several models; each model has its own
+    # paper-faithful defaults that are used when these are not passed).
+    p.add_argument("--omega1", type=float, default=None)
+    p.add_argument("--omega2", type=float, default=None)
+    p.add_argument("--omega3", type=float, default=None)
+    p.add_argument("--dampen1", type=float, default=None,
+                   help="DHO damping ratio (zeta); Q = 1/(2*zeta).")
+    p.add_argument("--dampen2", type=float, default=None)
+    p.add_argument("--dampen3", type=float, default=None)
+    p.add_argument("--constant", type=float, default=None,
+                   help="Mean count rate for sine-wave / DHO models.")
     p.add_argument("--gamma1", type=float, default=0.3,
                    help="Damping rate (used by FM / coupled-oscillator models).")
     p.add_argument("--gamma2", type=float, default=0.5)
