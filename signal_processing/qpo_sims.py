@@ -48,7 +48,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import fftconvolve
+from scipy.signal import fftconvolve, lfilter
 
 from stingray import Lightcurve, AveragedCrossspectrum, AveragedPowerspectrum
 from stingray import simulator
@@ -215,6 +215,23 @@ def frequency_from_noise(noise, f_base, f_scale, smooth_tau=None, dt=1.0):
     root = np.sqrt(counts)
     norm = np.sqrt(np.mean(counts)) + 1e-12
     return f_base + f_scale * (root / norm)
+
+
+def ou_process(N, dt, mean, tau, sigma, rng=None):
+    """Discrete-time Ornstein-Uhlenbeck process.
+
+    Update:  x[n+1] = mean + alpha*(x[n] - mean) + eta * xi[n]
+    with alpha = exp(-dt/tau), eta = sigma * sqrt(1 - alpha**2).
+    Stationary distribution: N(mean, sigma**2). Power spectrum is a
+    Lorentzian centred at 0 with HWHM 1/(2*pi*tau). Implemented via an
+    AR(1) lfilter for speed at large N.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    alpha = np.exp(-dt / tau)
+    eta = sigma * np.sqrt(1.0 - alpha**2)
+    y = lfilter([eta], [1.0, -alpha], rng.standard_normal(N))
+    return mean + y
 
 
 # =========================================================================
@@ -432,7 +449,7 @@ def model_coherent_sum(args) -> SimResult:
 
     f_shared = _opt(args.omega1, 1.0)
     f_sec_a  = _opt(args.omega2, 3.0)    # band 1's high-freq peak
-    f_sec_b  = _opt(args.omega3, 3.0)    # band 2's high-freq peak
+    f_sec_b  = _opt(args.omega3, 2.7)    # band 2's high-freq peak
     z_shared = _opt(args.dampen1, 0.1)
     z_sec_a  = _opt(args.dampen2, 0.1)
     z_sec_b  = _opt(args.dampen3, 0.15)
@@ -718,24 +735,93 @@ def model_multi_multiplicative(args) -> SweepResult:
 
 # ---- 7. Frequency-modulated QPO ------------------------------------------
 def model_fm(args) -> SimResult:
-    dt = 0.01
-    N = 400000
-    t = np.arange(N) * dt
-    sim = simulator.Simulator(N=N, mean=100000, dt=dt, rms=0.25, poisson=False)
-    drive = sim.simulate(2)
-    # Smooth linear sweep in resonant frequency (independent of drive magnitude)
-    f_t = 1.0 + 1.0 * (t / t[-1])
-    omega_t = 2 * np.pi * f_t
+    """QPO from frequency wandering rather than damping.
 
-    x1 = damped_oscillator_convolve(drive.counts, omega_t, args.gamma1, dt=dt)
-    x2 = damped_oscillator_convolve(drive.counts, omega_t, args.gamma2, dt=dt)
-    C = 100
-    lc1 = Lightcurve(t, x1 * C * 0.1 + C * 10)
-    lc2 = Lightcurve(t, x2 * C * 0.1 + C * 10)
+    The instantaneous frequency f(t) is an Ornstein-Uhlenbeck process with
+    mean f0, std `fm_sigma` and correlation time `fm_tau`. The QPO itself
+    is sin(integral of 2*pi*f(t)dt), so it is undamped and unit-amplitude;
+    the width of the resulting PSD peak comes purely from f(t) wandering.
+
+    Two-band setup: each band sees the same shared wander but can also
+    differ in three independent, optional ways (all default to identity,
+    so the two bands are identical out of the box):
+      * fm_sigma_band/fm_tau_band - independent OU perturbations to f(t).
+        Even small values strongly decohere because phase accumulates the
+        frequency-difference integral over the segment length.
+      * fm_sigma_phase/fm_tau_phase - independent OU perturbations applied
+        directly to the phase before sin(). Linear, intuitive knob in rad:
+        ~0.1 mild dip, ~pi total decoherence; independent of segment size.
+      * fm_df, fm_wander_scale - band 2 sees (f0 + fm_df) as its central
+        frequency and a wander amplitude scaled by fm_wander_scale.
+
+    Band 2 also lags band 1 by a constant `fm_delay`.
+    """
+    dt = 1 / 512
+    T = 1024
+    N = int(T / dt)
+    t = np.arange(N) * dt
+    rng = np.random.default_rng(11)
+
+    f0 = _opt(args.omega1, 1.5)               # central QPO freq [Hz]
+    sigma_f = _opt(args.fm_sigma, 0.15)       # std of common f-wander [Hz]
+    tau_f = _opt(args.fm_tau, 2.0)            # correlation time of common wander [s]
+    sigma_band = _opt(args.fm_sigma_band, 0.0)   # std of per-band f-perturbation [Hz]
+    tau_band = _opt(args.fm_tau_band, tau_f)     # correlation time of perturbation [s]
+    sigma_phase = _opt(args.fm_sigma_phase, 0.0) # std of per-band phase noise [rad]
+    tau_phase = _opt(args.fm_tau_phase, tau_f)   # correlation time of phase noise [s]
+    df_offset = _opt(args.fm_df, 0.0)         # offset added to band-2 central f [Hz]
+    wander_scale = _opt(args.fm_wander_scale, 1.0)  # band-2 wander amplitude scaling
+    delay_s = _opt(args.fm_delay, 5e-3)       # constant band-2 delay [s]
+
+    # Shared wander (deviation from f0) + optional per-band frequency
+    # perturbations (sigma_band) and phase noise (sigma_phase). Band 2 can
+    # also have an offset central frequency and a rescaled wander amplitude.
+    # All extra knobs default to the identity, so bands stay identical.
+    df_common = ou_process(N, dt, mean=0.0, tau=tau_f, sigma=sigma_f, rng=rng)
+    if sigma_band > 0:
+        rng_b1 = np.random.default_rng(21)
+        rng_b2 = np.random.default_rng(22)
+        df1 = ou_process(N, dt, mean=0.0, tau=tau_band, sigma=sigma_band, rng=rng_b1)
+        df2 = ou_process(N, dt, mean=0.0, tau=tau_band, sigma=sigma_band, rng=rng_b2)
+    else:
+        df1 = df2 = 0.0
+    if sigma_phase > 0:
+        rng_p1 = np.random.default_rng(31)
+        rng_p2 = np.random.default_rng(32)
+        dphi1 = ou_process(N, dt, mean=0.0, tau=tau_phase, sigma=sigma_phase, rng=rng_p1)
+        dphi2 = ou_process(N, dt, mean=0.0, tau=tau_phase, sigma=sigma_phase, rng=rng_p2)
+    else:
+        dphi1 = dphi2 = 0.0
+
+    f1_t = f0 + df_common + df1
+    f2_t = f0 + df_offset + wander_scale * df_common + df2
+    phase1 = 2 * np.pi * np.cumsum(f1_t) * dt + dphi1
+    phase2 = 2 * np.pi * np.cumsum(f2_t) * dt + dphi2
+    qpo1 = np.sin(phase1)
+    qpo2 = np.sin(phase2)
+
+    # Broadband floor (shared between bands)
+    bb, _ = _build_broadband(dt, N, seed=1)
+
+    # Inject into two bands; band 2 lags band 1 by `delay_s`
+    mean1, mean2 = 100.0, 40.0
+    frac_bb_1, frac_bb_2 = 0.25, 0.12
+    frac_qpo = 0.10
+    bb1 = bb * (frac_bb_1 * mean1 / bb.std())
+    bb2 = bb * (frac_bb_2 * mean2 / bb.std())
+
+    delay_n = int(round(delay_s / dt))
+    qpo2_delayed = np.roll(qpo2, delay_n)
+
+    rate1 = np.clip(mean1 + bb1 + frac_qpo * mean1 * qpo1,         0, None)
+    rate2 = np.clip(mean2 + bb2 + frac_qpo * mean2 * qpo2_delayed, 0, None)
+    lc1 = Lightcurve(t, rng.poisson(rate1), dt=dt, skip_checks=True)
+    lc2 = Lightcurve(t, rng.poisson(rate2), dt=dt, skip_checks=True)
+
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
     return SimResult(lc1, lc2, ps1, ps2, cs,
-                     vlines=(1.0, 2.0),
-                     t_lim=(0, 20), f_lim=(1 / args.segment, 20))
+                     vlines=(f0,),
+                     t_lim=(0, 20), f_lim=(0.1, 20))
 
 
 # ---- 8. Count-rate / frequency coupling (GRS1915-style) ------------------
@@ -776,28 +862,6 @@ def model_envelope_qpo(args) -> SimResult:
     return SimResult(lc1, lc2, ps1, ps2, cs,
                      vlines=(_opt(args.omega1, 1.5),),
                      t_lim=(0, T), f_lim=(1 / args.segment, 20))
-
-
-# ---- 10, 11, 12. Non-minimum-phase transfer functions --------------------
-
-def _tf_driven(tf_func, tf_kwargs, args) -> SimResult:
-    """Common helper: simulate a noise input, run it through a transfer function."""
-    dt = 1 / 512
-    T = 1024 / dt
-    sim = simulator.Simulator(N=int(T), mean=100, dt=dt, rms=0.5, poisson=True)
-    lc1 = sim.simulate(2)
-
-    _t_imp, h = frequency_to_impulse_response(tf_func, t_max=100, dt=0.01,
-                                              **tf_kwargs)
-    out = apply_transfer_function(lc1.counts, h, dt)
-    lc2 = Lightcurve(lc1.time, out)
-    ps1, ps2, cs = make_spectra(lc1, lc2, segment_size=args.segment)
-    return SimResult(lc1, lc2, ps1, ps2, cs,
-                     vlines=tuple(v for v in tf_kwargs.values()
-                                  if isinstance(v, (int, float)) and 0 < v < 50),
-                     t_lim=(0, 5), f_lim=(1 / args.segment, 50),
-                     label1="input", label2="output")
-
 
 # =========================================================================
 # CLI
@@ -847,8 +911,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--constant", type=float, default=None,
                    help="Mean count rate for sine-wave / DHO models.")
     p.add_argument("--gamma1", type=float, default=0.3,
-                   help="Damping rate (used by FM / coupled-oscillator models).")
+                   help="Damping rate (used by count_rate_fm / coupled-oscillator models).")
     p.add_argument("--gamma2", type=float, default=0.5)
+
+    # FM-model knobs
+    p.add_argument("--fm_sigma", type=float, default=None,
+                   help="fm: std of frequency wandering [Hz] (default 0.15).")
+    p.add_argument("--fm_tau", type=float, default=None,
+                   help="fm: correlation time of frequency wandering [s] "
+                        "(default 2.0).")
+    p.add_argument("--fm_sigma_band", type=float, default=None,
+                   help="fm: std of per-band independent frequency "
+                        "perturbation [Hz] (default 0 = identical bands).")
+    p.add_argument("--fm_tau_band", type=float, default=None,
+                   help="fm: correlation time of per-band perturbation [s] "
+                        "(default same as fm_tau).")
+    p.add_argument("--fm_sigma_phase", type=float, default=None,
+                   help="fm: std of per-band phase noise [rad] applied directly "
+                        "before sin() (default 0). Linear decoherence knob: "
+                        "~0.1 mild, ~pi total.")
+    p.add_argument("--fm_tau_phase", type=float, default=None,
+                   help="fm: correlation time of per-band phase noise [s] "
+                        "(default same as fm_tau).")
+    p.add_argument("--fm_df", type=float, default=None,
+                   help="fm: offset added to band-2 central frequency [Hz] "
+                        "(default 0 = same central freq).")
+    p.add_argument("--fm_wander_scale", type=float, default=None,
+                   help="fm: scaling of band-2 wander amplitude relative to "
+                        "band 1 (default 1.0 = same wander).")
+    p.add_argument("--fm_delay", type=float, default=None,
+                   help="fm: constant time delay between bands [s] (default 5e-3).")
 
     # Non-min phase TF options
     p.add_argument("--omega_z", type=float, default=1.0)
