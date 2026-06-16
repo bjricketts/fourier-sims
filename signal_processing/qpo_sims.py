@@ -924,6 +924,7 @@ MODELS: dict[str, Callable[[argparse.Namespace], SimResult]] = {
     "damping":              model_damping,
     "coherent_sum":         model_coherent_sum,
     "hidden":               model_hidden,
+    "resonance":            model_resonance,
     "multi_incoherent":     model_multi_incoherent,
     "multi_coherent":       model_multi_coherent,
     "multi_multiplicative": model_multi_multiplicative,
