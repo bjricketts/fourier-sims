@@ -330,10 +330,10 @@ def plot_crossspectral(res: SimResult, savepath: str):
     ax3.set_ylabel('Phase (radians)')
 
     # Panel 4 -- coherence
-    coh = res.avgcs12.coherence()[0]
+    coh = res.avgcs12.intrinsic_coherence()[0]
     ax4.plot(res.avgcs12.freq, coh, c='black', lw=2.0)
     ax4.set_ylim(0, 1.05)
-    ax4.set_ylabel('Coherence')
+    ax4.set_ylabel('Intrinsic Coherence')
 
     for ax in axes:
         _add_vlines(ax, res.vlines)
@@ -393,7 +393,7 @@ def plot_crossspectral_sweep(res: SweepResult, savepath: str):
     ax3.set_ylabel('Phase lag [radians]')
     ax3.set_ylim(*res.lag_ylim)
 
-    ax4.set_ylabel('Coherence')
+    ax4.set_ylabel('Intrinsic Coherence')
     ax4.set_ylim(*res.coh_ylim)
     ax4.set_xlim(*res.f_lim)
 
@@ -863,7 +863,7 @@ def model_count_rate_fm(args) -> SimResult:
     rms = 0.5
     mean1 = args.constant if args.constant is not None else 1e3
     mean2 = mean1 * 0.8
-    frac_qpo = 1.0
+    frac_qpo = 0.3
 
     bb, _ = _build_broadband(dt, N, seed=1, rms=rms, mean=mean1)
     qpo_freq = _opt(args.omega1, 1.5) + 0.001 * bb  # Linear dependence on broadband
