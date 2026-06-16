@@ -40,4 +40,10 @@ python qpo_sims.py multi_incoherent --outdir figures --seed 0   # Fig. 6 (a)
 python qpo_sims.py multi_coherent   --outdir figures --seed 0   # Fig. 6 (b)
 ```
 
-All models default to the parameters used in the paper.
+All models default to the parameters used in the paper. To run all the models in the paper, one can 
+simply run the following command:
+
+```
+mkdir -p figures
+python qpo_sims.py all
+```
