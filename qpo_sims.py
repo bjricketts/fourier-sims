@@ -40,8 +40,10 @@ import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from matplotlib.ticker import ScalarFormatter
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 from scipy.signal import fftconvolve, lfilter
 
 from stingray import Lightcurve, AveragedCrossspectrum, AveragedPowerspectrum
@@ -231,6 +233,9 @@ class SweepResult:
     legend_title: str = "QPO frac rms"
     label1: str = "band 1"
     label2: str = "band 2"
+    show_cross: bool = True    # False -> omit the Re/Im cross-spectrum panel
+    fixed_bands: tuple = ()    # bands (1 and/or 2) not touched by the sweep;
+                               # drawn once in black instead of coloured per point
 
 
 def _add_vlines(ax, vlines):
@@ -244,6 +249,9 @@ def _add_vlines(ax, vlines):
 # as the dark/light endpoints of the sweep colour bar.
 _C_DARK = plt.cm.viridis(0.15)
 _C_LIGHT = plt.cm.viridis(0.6)
+
+_C_REAL = "#E07B39"
+_C_IMAG = "#5B8DB8"
 
 
 def plot_lightcurves(res: SimResult, savepath: str):
@@ -262,17 +270,17 @@ def plot_lightcurves(res: SimResult, savepath: str):
     print(f"  -> {savepath}")
 
 
-def _setup_xspec_axes(figsize=(7, 10)):
-    """Build the shared 4-row layout: PSD / CS / phase-or-lag / coherence.
+def _setup_xspec_axes(figsize=(7, 10), nrows=4):
+    """Build the shared stacked layout (default 4 rows: PSD / CS / lag / coherence).
 
     Axes share x; spacing between rows is collapsed so the figure reads as
     a single stacked plot. Bottom row is the only one with an x-axis label.
     """
-    fig, axes = plt.subplots(4, 1, figsize=figsize, sharex=True,
+    fig, axes = plt.subplots(nrows, 1, figsize=figsize, sharex=True,
                              gridspec_kw={'hspace': 0})
     for ax in axes:
         ax.set_xscale('log')
-    axes[3].set_xlabel('Frequency (Hz)')
+    axes[-1].set_xlabel('Frequency (Hz)')
     return fig, axes
 
 
@@ -290,7 +298,7 @@ def _symlog_threshold(arrays, frac=1e-3, floor=1e-4):
     return np.max([max_abs * frac, floor])
 
 
-def plot_crossspectral(res: SimResult, savepath: str):
+def plot_crossspectral(res: SimResult, savepath: str, args):
     """Single-realisation 4-panel cross-spectral figure.
 
     Layout: PSD_1 + PSD_2 / CS (Re, Im) / phase lag / coherence.
@@ -301,19 +309,19 @@ def plot_crossspectral(res: SimResult, savepath: str):
     # Panel 1 -- PSDs
     ax1.errorbar(res.ps1.freq, res.ps1.freq * res.ps1.power,
                  yerr=res.ps1.freq * res.ps1.power_err,
-                 c=_C_DARK, label=r"PSD$_1$", lw=2.0)
+                 c=_C_DARK, label=res.label1, lw=2.0)
     ax1.errorbar(res.ps2.freq, res.ps2.freq * res.ps2.power,
                  yerr=res.ps2.freq * res.ps2.power_err,
-                 c=_C_LIGHT, label=r"PSD$_2$", lw=2.0)
+                 c=_C_LIGHT, label=res.label2, lw=2.0)
     ax1.set_yscale('log')
     ax1.set_ylabel(r'Frequency $\cdot$ Power (rms$^2$)')
-    ax1.legend(loc='upper left', fontsize=9)
+    ax1.legend(loc='lower left', fontsize=9)
 
     # Panel 2 -- Real / Imaginary cross-spectrum
     re = np.real(res.avgcs12.power)
     im = np.imag(res.avgcs12.power)
-    ax2.plot(res.avgcs12.freq, re, c=_C_DARK, label='Real', lw=2.0)
-    ax2.plot(res.avgcs12.freq, im, c=_C_LIGHT, label='Imaginary', lw=2.0)
+    ax2.plot(res.avgcs12.freq, re, c=_C_REAL, label='Real', lw=2.0)
+    ax2.plot(res.avgcs12.freq, im, c=_C_IMAG, label='Imaginary', lw=2.0)
     ax2.axhline(0, color='gray', lw=0.5)
     ax2.set_yscale('symlog', linthresh=_symlog_threshold([re, im]))
     ax2.set_ylabel('Cross-spectrum')
@@ -335,6 +343,36 @@ def plot_crossspectral(res: SimResult, savepath: str):
     ax4.set_ylim(0, 1.05)
     ax4.set_ylabel('Intrinsic Coherence')
 
+    if args.zoomin:
+        from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
+        # Create inset axes — tweak loc/width/height to taste
+        axins = inset_axes(ax4, width='55%', height='35%', loc='lower center',
+                        borderpad=2.5)
+
+        # Replicate the same sweep data into the inset
+        axins.semilogx(res.avgcs12.freq, coh, color='black', alpha=0.85,
+                        drawstyle='steps-mid')
+        _add_vlines(axins, res.vlines)
+
+        # Zoom window — either from args or a sensible default
+        z = args.zoomin_lims  # expect a 2-tuple (flo, fhi), e.g. (0.5, 2.0)
+        if isinstance(z, (list, tuple)) and len(z) == 2:
+            x1, x2 = float(z[0]), float(z[1])
+        else:
+            # fallback: middle decade of f_lim
+            x1 = res.f_lim[0] * 3
+            x2 = res.f_lim[1] / 3
+
+        axins.set_xlim(x1, x2)
+        axins.set_ylim(0.9, 1.01)   # or tighten if you prefer
+        # Explicitly override all tick/label styling on the inset
+        axins.tick_params(axis='both', labelsize=7, which='both')
+        axins.xaxis.offsetText.set_visible(False)
+        axins.yaxis.offsetText.set_visible(False)
+
+        # Box + connector lines; corners 2,4 = bottom-left & top-right
+        mark_inset(ax4, axins, loc1=2, loc2=1, fc='none', ec='0.4', lw=0.8)
+
     for ax in axes:
         _add_vlines(ax, res.vlines)
     axes[0].set_xlim(*res.f_lim)
@@ -345,49 +383,169 @@ def plot_crossspectral(res: SimResult, savepath: str):
     print(f"  -> {savepath}")
 
 
-def plot_crossspectral_sweep(res: SweepResult, savepath: str):
-    """rms-sweep 4-panel figure with the same layout as plot_crossspectral.
+def plot_psd_with(res: SimResult, savepath: str, args, lower='phase'):
+    """Single-realisation 2-panel figure: PSDs on top, one diagnostic below.
 
-    Layout: PSD_1 (solid) + PSD_2 (dashed) / CS Real (solid) + Imag (dotted)
-    / time lag [ms] / coherence. Colour encodes the swept rms value.
+    A trimmed variant of plot_crossspectral. The lower panel is either the
+    phase lag (``lower='phase'``) or the intrinsic coherence
+    (``lower='coherence'``).
     """
-    fig, axes = _setup_xspec_axes(figsize=(8, 12))
-    ax1, ax2, ax3, ax4 = axes
+    fig, axes = plt.subplots(2, 1, figsize=(7, 5), sharex=True,
+                             gridspec_kw={'hspace': 0})
+    for ax in axes:
+        ax.set_xscale('log')
+    axes[1].set_xlabel('Frequency (Hz)')
+    ax1, ax2 = axes
+
+    # Panel 1 -- PSDs
+    ax1.errorbar(res.ps1.freq, res.ps1.freq * res.ps1.power,
+                 yerr=res.ps1.freq * res.ps1.power_err,
+                  label=res.label1, lw=2.0)
+    ax1.errorbar(res.ps2.freq, res.ps2.freq * res.ps2.power,
+                 yerr=res.ps2.freq * res.ps2.power_err,
+                  label=res.label2, lw=2.0)
+    ax1.set_yscale('log')
+    ax1.set_ylabel(r'Frequency $\cdot$ Power (rms$^2$)')
+    ax1.legend(loc='upper left', fontsize=9)
+
+    # Panel 2 -- phase lag or coherence
+    if lower == 'phase':
+        phase, phase_err = res.avgcs12.phase_lag()
+        ax2.errorbar(res.avgcs12.freq, phase, yerr=res.avgcs12.lag_err,
+                     c='black', lw=2.0)
+        ax2.axhline(0, color='gray', lw=0.5)
+        pad = max(float(np.nanmax(np.abs(phase))) * 1.4, 0.1) if len(phase) else 0.5
+        ax2.set_ylim(-min(pad, np.pi), min(pad, np.pi))
+        ax2.set_ylabel('Phase (radians)')
+    elif lower == 'coherence':
+        coh = res.avgcs12.intrinsic_coherence()[0]
+        ax2.plot(res.avgcs12.freq, coh, c='black', lw=2.0)
+        ax2.set_ylim(0, 1.05)
+        ax2.set_ylabel('Intrinsic Coherence')
+    else:
+        raise ValueError(f"lower must be 'phase' or 'coherence', got {lower!r}")
+
+    for ax in axes:
+        _add_vlines(ax, res.vlines)
+    axes[0].set_xlim(*res.f_lim)
+
+    fig.align_ylabels(axes)
+    fig.savefig(savepath, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  -> {savepath}")
+
+
+def plot_crossspectral_sweep(res: SweepResult, savepath: str, args):
+    """rms-sweep figure with the same layout family as plot_crossspectral.
+
+    Full layout (show_cross=True, default): PSD_1 (solid) + PSD_2 (dashed) /
+    CS Real (solid) + Imag (dotted) / phase lag / coherence. When
+    ``res.show_cross`` is False the cross-spectrum panel is omitted, leaving
+    PSD / phase lag / coherence. Colour encodes the swept value.
+    """
+    show_cross = getattr(res, "show_cross", True)
+    nrows = 4 if show_cross else 3
+    figsize = (8, 12) if show_cross else (8, 9)
+    fig, axes = _setup_xspec_axes(figsize=figsize, nrows=nrows)
+    if show_cross:
+        ax1, ax2, ax3, ax4 = axes
+    else:
+        ax1, ax3, ax4 = axes
+        ax2 = None
     cmap = plt.cm.viridis(np.linspace(0.15, 0.9, len(res.entries)))
+    fixed_bands = set(getattr(res, "fixed_bands", ()) or ())
+
+    # Fixed (un-swept) bands are identical across all sweep points, so draw
+    # each one once in solid black from the last entry. Swept bands are drawn
+    # coloured and solid, one curve per sweep point. With no fixed bands
+    # (the default), fall back to the original coloured solid/dashed pair.
+    if fixed_bands:
+        last_entry = res.entries[-1]
+        for b in sorted(fixed_bands):
+            ps = last_entry[f'ps{b}']
+            ax1.loglog(ps.freq, ps.freq * ps.power,
+                       color='black', lw=2.0, label=f'band {b} (fixed)')
 
     re_all, im_all = [], []
+    swept_bands_sorted = sorted({1, 2} - fixed_bands) if fixed_bands else []
+    label_band = swept_bands_sorted[0] if swept_bands_sorted else None
     for r, c in zip(res.entries, cmap):
-        lbl = f'{r["frac_qpo"] * 100:.2f}%'
-        ax1.loglog(r['ps1'].freq, r['ps1'].freq * r['ps1'].power,
-                   color=c, alpha=0.85, label=lbl)
-        ax1.loglog(r['ps2'].freq, r['ps2'].freq * r['ps2'].power,
-                   color=c, alpha=0.5, ls='--')
+        lbl = r.get("label") or f'{r["frac_qpo"] * 100:.2f}%'
+        if fixed_bands:
+            # Only the swept band(s) get a coloured, solid curve per point.
+            # Attach the sweep label to a single band so the legend has one
+            # entry per sweep point rather than duplicates.
+            for b in swept_bands_sorted:
+                ps = r[f'ps{b}']
+                ax1.loglog(ps.freq, ps.freq * ps.power,
+                           color=c, alpha=0.85, lw=2.0,
+                           label=lbl if b == label_band else None)
+        else:
+            ax1.loglog(r['ps1'].freq, r['ps1'].freq * r['ps1'].power,
+                       color=c, alpha=0.85, label=lbl)
+            ax1.loglog(r['ps2'].freq, r['ps2'].freq * r['ps2'].power,
+                       color=c, alpha=0.5, ls='--')
 
-        re = np.real(r['cs'].power)
-        im = np.imag(r['cs'].power)
-        ax2.plot(r['cs'].freq, re, color=c, alpha=0.85, lw=2.0)
-        ax2.plot(r['cs'].freq, im, color=c, alpha=0.65, lw=2.0, ls=':')
-        re_all.append(re); im_all.append(im)
+        if show_cross:
+            re = np.real(r['cs'].power)
+            im = np.imag(r['cs'].power)
+            ax2.plot(r['cs'].freq, re, color=c, alpha=0.85, lw=2.0)
+            ax2.plot(r['cs'].freq, im, color=c, alpha=0.65, lw=2.0, ls=':')
+            re_all.append(re); im_all.append(im)
 
         ax3.errorbar(r['cs'].freq, r['lag'], yerr=r['lag_e'],
                      color=c, alpha=0.8, ms=3, lw=2)
         ax4.semilogx(r['cs'].freq, r['coh'], color=c, alpha=0.85,
                      drawstyle='steps-mid')
+        
+        if args.zoomin:
+            from mpl_toolkits.axes_grid1.inset_locator import inset_axes, mark_inset
+
+            # Create inset axes — tweak loc/width/height to taste
+            axins = inset_axes(ax4, width='55%', height='35%', loc='lower center',
+                            borderpad=2.5)
+
+            # Replicate the same sweep data into the inset
+            for r, c in zip(res.entries, cmap):
+                axins.semilogx(r['cs'].freq, r['coh'], color=c, alpha=0.85,
+                            drawstyle='steps-mid')
+            _add_vlines(axins, res.vlines)
+
+            # Zoom window — either from args or a sensible default
+            z = args.zoomin_lims  # expect a 2-tuple (flo, fhi), e.g. (0.5, 2.0)
+            if isinstance(z, (list, tuple)) and len(z) == 2:
+                x1, x2 = float(z[0]), float(z[1])
+            else:
+                # fallback: middle decade of f_lim
+                x1 = res.f_lim[0] * 3
+                x2 = res.f_lim[1] / 3
+
+            axins.set_xlim(x1, x2)
+            axins.set_ylim(0.8, 1.01)   # or tighten if you prefer
+            # Explicitly override all tick/label styling on the inset
+            axins.tick_params(axis='both', labelsize=7, which='both')
+            axins.tick_params(axis='both', which='minor', labelbottom=False, labelleft=False)
+            axins.xaxis.offsetText.set_visible(False)
+            axins.yaxis.offsetText.set_visible(False)
+
+            # Box + connector lines; corners 2,4 = bottom-left & top-right
+            mark_inset(ax4, axins, loc1=2, loc2=1, fc='none', ec='0.4', lw=0.8)
 
     ax1.set_ylabel(r'PSD $\times \nu$ [(rms/mean)$^2$]')
     # if res.title:
     #     ax1.set_title(res.title)
     ax1.legend(title=res.legend_title, fontsize=8, ncol=2, loc='upper left')
 
-    ax2.axhline(0, color='gray', lw=0.5)
-    ax2.set_yscale('symlog', linthresh=_symlog_threshold(re_all + im_all))
-    ax2.set_ylabel('Cross-spectrum')
-    # Linestyle-only legend explaining Re vs Im across all sweep colours
-    from matplotlib.lines import Line2D
-    ax2.legend(handles=[
-        Line2D([0], [0], color='gray', lw=1.5, label='Real'),
-        Line2D([0], [0], color='gray', lw=1.5, ls=':', label='Imaginary'),
-    ], loc='lower left', fontsize=9)
+    if show_cross:
+        ax2.axhline(0, color='gray', lw=0.5)
+        ax2.set_yscale('symlog', linthresh=_symlog_threshold(re_all + im_all))
+        ax2.set_ylabel('Cross-spectrum')
+        # Linestyle-only legend explaining Re vs Im across all sweep colours
+        from matplotlib.lines import Line2D
+        ax2.legend(handles=[
+            Line2D([0], [0], color='gray', lw=1.5, label='Real'),
+            Line2D([0], [0], color='gray', lw=1.5, ls=':', label='Imaginary'),
+        ], loc='lower left', fontsize=9)
 
     ax3.axhline(0.0, ls=':', color='gray', alpha=0.5)
     ax3.set_ylabel('Phase lag [radians]')
@@ -462,8 +620,10 @@ def model_damping(args) -> SimResult:
     lc2 = _dho_band(driver, t, dt, [(f2, z2)], mean, frac=0.05, rng=rng2)
 
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
+    ps1, ps2, cs = [p.rebin_log(f=0.03) for p in (ps1, ps2, cs)]
     return SimResult(lc1, lc2, ps1, ps2, cs,
-                     vlines=(f1, f2), t_lim=(0, 5), f_lim=(0.5, 20))
+                     vlines=(f1, f2), t_lim=(0, 5), f_lim=(0.5, 20),
+                     label1=r"$\zeta_1 = 0.05$", label2=r"$\zeta_2 = 0.15$")
 
 
 # ---- 2. Two coherent peaks per band (dual-signal case) -------------------
@@ -492,9 +652,12 @@ def model_coherent_sum(args) -> SimResult:
                     mean, frac=0.05, rng=rng)
 
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
+    ps1, ps2, cs = [p.rebin_log(f=0.03) for p in (ps1, ps2, cs)]
     return SimResult(lc1, lc2, ps1, ps2, cs,
                      vlines=(f_shared, f_sec_a, f_sec_b),
-                     t_lim=(0, 5), f_lim=(0.1, 12))
+                     t_lim=(0, 5), f_lim=(0.1, 12),
+                     label1=r"$f_1 = 1.0, f_2 = 3.0$, $\zeta_1 = 0.1, \zeta_2 = 0.1$",
+                     label2=r"$f_1 = 1.0, f_2 = 2.7$, $\zeta_1 = 0.1, \zeta_2 = 0.15$")
 
 # ---- 3. Different resonant frequencies -----------------------------------
 def model_resonance(args) -> SimResult:
@@ -514,9 +677,12 @@ def model_resonance(args) -> SimResult:
     lc2 = _dho_band(driver, t, dt, [(f2, z)], mean, frac=0.05, rng=rng)
 
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
+    ps1, ps2, cs = [p.rebin_log(f=0.03) for p in (ps1, ps2, cs)]
     return SimResult(lc1, lc2, ps1, ps2, cs,
                      vlines=(f1, f2),
-                     t_lim=(0, 5), f_lim=(0.5, 20))
+                     t_lim=(0, 5), f_lim=(0.5, 20),
+                     label1=r"$f_1 = 5.0$, $\zeta = 0.05$",
+                     label2=r"$f_2 = 6.0$, $\zeta = 0.05$")
 
 # ---- 4. "Hidden" QPO in broadband (paper Fig. 4) -------------------------
 
@@ -569,9 +735,10 @@ def _sweep_qpo_rms(broadband_pri, broadband_sec, qpo_pri_unit, qpo_sec_unit,
         ps2 = AveragedPowerspectrum(lc2, segment_size=segment, norm='frac')
         cs = AveragedCrossspectrum(lc2, lc1, segment_size=segment, norm='frac')
         if rebin is not None:
-            ps1.rebin_log(f=rebin)
-            ps2.rebin_log(f=rebin)
-            cs.rebin_log(f=rebin)
+            print("Rebinning to factor {:.3f}".format(rebin))
+            ps1 = ps1.rebin_log(f=rebin)
+            ps2 = ps2.rebin_log(f=rebin)
+            cs = cs.rebin_log(f=rebin)
 
         try:
             coh, _ = cs.intrinsic_coherence()
@@ -590,16 +757,20 @@ def model_hidden(args) -> SweepResult:
     T_bins = int(1024 / dt)
     broadband, t = _build_broadband(dt, T_bins, seed=args.seed)
 
-    f0_qpo, zeta = 1.5, 0.05      # Q = 10
+    f0_qpo = _opt(args.omega1, 1.5)      # Q = 10 at default zeta
+    zeta = _opt(args.dampen1, 0.05)
     test_resp = dho_filter(broadband, dt, f0=f0_qpo, zeta=zeta, gain=1.0)
     qpo_unit = test_resp / test_resp.std()
 
-    frac_vals = np.geomspace(1e-3, 5e-2, 6)
+    frac_lo = _opt(getattr(args, 'frac_lo', None), 1e-3)
+    frac_hi = _opt(getattr(args, 'frac_hi', None), 5e-2)
+    frac_n = _opt(getattr(args, 'frac_n', None), 6)
+    frac_vals = np.geomspace(frac_lo, frac_hi, int(frac_n))
     entries = _sweep_qpo_rms(
         broadband, broadband, qpo_unit, None,
         t, dt, segment=16.0,
         frac_qpo_vals=frac_vals, frac_qpo_sec_vals=np.zeros_like(frac_vals),
-        seed=11)
+        rebin=0.05, seed=11)
 
     last = entries[-1]
     return SweepResult(
@@ -648,6 +819,8 @@ def _model_multi_qpo(args, shared_driver: bool) -> SweepResult:
         frac_qpo_vals=frac_vals, frac_qpo_sec_vals=frac_vals * 0.5,
         mean1=100.0, mean2=100.0, frac_bb_1=0.12, frac_bb_2=0.06,
         rebin=0.05, seed=11)
+
+    print(entries[-1]["ps1"].freq[1:10])
 
     last = entries[-1]
     kind = "Coherent" if shared_driver else "Incoherent"
@@ -729,9 +902,9 @@ def model_multi_multiplicative(args) -> SweepResult:
         ps1 = AveragedPowerspectrum(lc1, segment_size=16.0, norm='frac')
         ps2 = AveragedPowerspectrum(lc2, segment_size=16.0, norm='frac')
         cs = AveragedCrossspectrum(lc2, lc1, segment_size=16.0, norm='frac')
-        ps1.rebin_log(f=0.05)
-        ps2.rebin_log(f=0.05)
-        cs.rebin_log(f=0.05)
+        ps1 = ps1.rebin_log(f=0.03)
+        ps2 = ps2.rebin_log(f=0.03)
+        cs = cs.rebin_log(f=0.03)
         try:
             coh, _ = cs.intrinsic_coherence()
         except Exception:
@@ -841,6 +1014,7 @@ def model_fm(args) -> SimResult:
     lc2 = Lightcurve(t, rng.poisson(rate2), dt=dt, skip_checks=True)
 
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
+    ps1, ps2, cs = [p.rebin_log(f=0.03) for p in (ps1, ps2, cs)]
     return SimResult(lc1, lc2, ps1, ps2, cs,
                      vlines=(f0,),
                      t_lim=(0, 20), f_lim=(0.1, 20))
@@ -879,6 +1053,7 @@ def model_count_rate_fm(args) -> SimResult:
     lc2 = Lightcurve(t, rng.poisson(rate2), dt=dt, skip_checks=True)
 
     ps1, ps2, cs = make_spectra(lc1, lc2, args.segment)
+    ps1, ps2, cs = [p.rebin_log(f=0.03) for p in (ps1, ps2, cs)]
     return SimResult(lc1, lc2, ps1, ps2, cs,
                      vlines=(),
                      t_lim=(0, 20), f_lim=(0.1, 20))
@@ -969,6 +1144,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Damping rate (used by count_rate_fm / coupled-oscillator models).")
     p.add_argument("--gamma2", type=float, default=0.5)
 
+    # hidden-model internal frac-rms sweep range (defaults preserve current behaviour)
+    p.add_argument("--frac_lo", type=float, default=None,
+                   help="hidden: low end of QPO frac-rms geomspace (default 1e-3).")
+    p.add_argument("--frac_hi", type=float, default=None,
+                   help="hidden: high end of QPO frac-rms geomspace (default 5e-2).")
+    p.add_argument("--frac_n", type=int, default=None,
+                   help="hidden: number of frac-rms sweep points (default 6).")
+
     # FM-model knobs
     p.add_argument("--fm_sigma", type=float, default=None,
                    help="fm: std of frequency wandering [Hz] (default 0.15).")
@@ -997,17 +1180,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fm_delay", type=float, default=None,
                    help="fm: constant time delay between bands [s] (default 5e-3).")
 
-    # Non-min phase TF options
-    p.add_argument("--omega_z", type=float, default=1.0)
-    p.add_argument("--gamma_z", type=float, default=0.1)
-    p.add_argument("--alpha", type=float, default=1.0,
-                   help="Echo amplitude.")
-    p.add_argument("--tau", type=float, default=0.1,
-                   help="Echo delay (s).")
-    p.add_argument("--kappa", type=float, default=0.1,
-                   help="Coupling strength for coupled oscillators.")
-    p.add_argument("--zero_type", default="minimum",
-                   choices=["minimum", "nonminimum"])
+    # Parameter-sweep driver: repeat the run over a grid of CLI-param values.
+    # e.g. --sweep dampen2=0.05,0.1,0.15,0.2  --sweep omega2=5,6,7
+    # Multiple --sweep flags are combined as a Cartesian product. Each point
+    # is written with an auto-generated --name suffix so nothing is overwritten.
+    p.add_argument("--sweep", action="append", default=None, metavar="PARAM=v1,v2,...",
+                   help="Sweep a CLI parameter over a comma-separated value list. "
+                        "Repeatable; multiple flags form a Cartesian product.")
+
+    # Plotting options
+    p.add_argument("--show-cross", action=argparse.BooleanOptionalAction,
+                   default=None, dest="show_cross",
+                   help="Show the Re/Im cross-spectrum panel in sweep figures. "
+                        "Use --show-cross to force it on or --no-show-cross to "
+                        "force it off. If unset, it defaults to on except for "
+                        "damping/frequency sweeps, where it is off.")
+    p.add_argument("--zoomin", type=bool, default=False,
+                   help="Zoom in on the coherence / lag panels (default False).")
+    p.add_argument("--zoomin_lims", type=float, nargs=2, default=None,
+                   help="Zoom limits for the coherence / lag panels (default None).")
+    p.add_argument("--phaselag-psd", type=bool, default=False,
+                   help="Also produce a 2-panel PSD + phase-lag figure.")
+    p.add_argument("--coherence-psd", type=bool, default=False,
+                   help="Also produce a 2-panel PSD + coherence figure.")
 
     return p
 
@@ -1021,19 +1216,274 @@ def run_one(name: str, args) -> None:
         base = os.path.join(args.outdir, f"{args.name}_{name}")
     plot_lightcurves(res, f"{base}_lightcurve.{args.ext}")
     if isinstance(res, SweepResult):
-        plot_crossspectral_sweep(res, f"{base}_crossspectral.{args.ext}")
+        # Let an explicit --show-cross / --no-show-cross override the model's
+        # own default; leave it untouched when the flag is unset.
+        cli_show_cross = getattr(args, "show_cross", None)
+        if cli_show_cross is not None:
+            res.show_cross = cli_show_cross
+        plot_crossspectral_sweep(res, f"{base}_crossspectral.{args.ext}", args)
     else:
-        plot_crossspectral(res, f"{base}_crossspectral.{args.ext}")
+        plot_crossspectral(res, f"{base}_crossspectral.{args.ext}", args)
+        if getattr(args, 'phaselag_psd', False):
+            plot_psd_with(res, f"{base}_phaselag_psd.{args.ext}", args,
+                          lower='phase')
+        if getattr(args, 'coherence_psd', False):
+            plot_psd_with(res, f"{base}_coherence_psd.{args.ext}", args,
+                          lower='coherence')
+
+
+def _simresult_to_entry(res: SimResult, label: str) -> dict:
+    """Convert a single-realisation SimResult into a sweep entry dict of the
+    same schema plot_crossspectral_sweep consumes.
+
+    coh/lag/lag_e are derived from the SimResult's cross-spectrum exactly as
+    the native SweepResult models compute them (intrinsic coherence with a
+    plain-coherence fallback, phase_lag for the lag).
+    """
+    cs = res.avgcs12
+    try:
+        coh, _ = cs.intrinsic_coherence()
+    except Exception:
+        coh, _ = cs.coherence()
+    lag, lag_e = cs.phase_lag()
+    return dict(frac_qpo=np.nan, label=label,
+                ps1=res.ps1, ps2=res.ps2, cs=cs,
+                coh=coh, lag=lag, lag_e=lag_e,
+                lc1=res.lc1, lc2=res.lc2)
+
+
+# Explicit map of which band each CLI parameter drives, per model. Used to
+# decide which band is held fixed (drawn once in black) during an aggregated
+# sweep. Values: 1 -> band 1 only, 2 -> band 2 only, "both" -> shared between
+# bands (so sweeping it fixes neither). Parameters absent from a model's entry
+# fall back to the trailing-digit heuristic below. Models without an entry
+# here use the heuristic for every parameter.
+_MODEL_PARAM_BANDS = {
+    # differing damping at a common frequency: ...1 -> band 1, ...2 -> band 2
+    "damping":      {"omega1": 1, "dampen1": 1, "omega2": 2, "dampen2": 2},
+    # different resonant frequencies, shared damping
+    "resonance":    {"omega1": 1, "omega2": 2, "dampen1": "both"},
+    # two coherent peaks per band: ...1 is the shared low-freq peak, ...2 is
+    # band 1's secondary peak, ...3 is band 2's secondary peak
+    "coherent_sum": {"omega1": "both", "dampen1": "both",
+                     "omega2": 1, "dampen2": 1,
+                     "omega3": 2, "dampen3": 2},
+}
+
+
+def _constant_vlines(all_vlines, atol=1e-9):
+    """Return the vertical-guide frequencies that are the same across every
+    sweep entry. A guide marking a swept quantity moves from point to point,
+    so a single line at one value is misleading -> such lines are dropped.
+    Positions that vary (or are None in any entry) are removed.
+    """
+    if not all_vlines:
+        return ()
+    ref = all_vlines[0]
+    kept = []
+    for i, v in enumerate(ref):
+        if v is None:
+            continue
+        same = all(i < len(o) and o[i] is not None and abs(o[i] - v) <= atol
+                   for o in all_vlines)
+        if same:
+            kept.append(v)
+    return tuple(kept)
+
+
+def _run_aggregated_sweep(name, args, axes, base_name):
+    """Run a SimResult-returning model across the sweep grid and collapse the
+    results into ONE SweepResult figure (like the native swept models).
+
+    Each grid point calls the model unchanged; only the swept CLI args differ.
+    The per-curve legend label is the swept param(s)=value(s) for that point.
+    """
+    import copy
+    import itertools
+
+    params = [p for p, _ in axes]
+    # Classify the sweep by the physical quantity being varied so the legend
+    # uses the right symbol and the layout matches the damping case:
+    #   * all dampenN params -> zeta sweep   (legend $\zeta$, labels $\zeta_N=..$)
+    #   * all omegaN params  -> frequency    (legend $f$,      labels $f_N=..$)
+    # Both drop the cross-spectrum panel (PSD / phase lag / coherence only).
+    # Anything else (mixed, or unrecognised params) keeps the full 4-panel
+    # figure with plain 'param=value' labels.
+    def _all_prefixed(prefix):
+        return bool(params) and all(
+            p.startswith(prefix) and p[len(prefix):].isdigit() for p in params)
+    damping_sweep = _all_prefixed("dampen")
+    freq_sweep = _all_prefixed("omega")
+
+    def _sym_label(param, value):
+        """Legend label like '$\\zeta_{2} = 0.15$' or '$f_{2} = 6$'."""
+        if damping_sweep:
+            sym, prefix = r"\zeta", "dampen"
+        else:  # freq_sweep
+            sym, prefix = "f", "omega"
+        sub = param[len(prefix):]          # '1' / '2' / '3'
+        vtxt = f"{value:g}" if isinstance(value, float) else str(value)
+        return rf"${sym}_{{{sub}}} = {vtxt}$"
+
+    special_sweep = damping_sweep or freq_sweep
+
+    # Map each swept parameter to the band(s) it drives, to decide which band
+    # (if any) is held fixed and drawn once in black. Prefer the explicit
+    # per-model map; fall back to the trailing-digit heuristic ('1' -> band 1,
+    # else band 2) for models/params not listed there. A param that drives
+    # "both" bands (a shared component) means neither band is fixed.
+    model_map = _MODEL_PARAM_BANDS.get(name, {})
+
+    def _param_band(p):
+        """Return 1, 2, 'both', or None (param drives no single band)."""
+        if p in model_map:
+            return model_map[p]
+        digits = "".join(ch for ch in p if ch.isdigit())
+        if not digits:
+            return None
+        return 1 if digits == "1" else 2
+
+    swept_bands = set()
+    for p in params:
+        b = _param_band(p)
+        if b == "both":
+            swept_bands |= {1, 2}
+        elif b in (1, 2):
+            swept_bands.add(b)
+    fixed_bands = tuple(sorted({1, 2} - swept_bands)) if swept_bands else ()
+
+    entries = []
+    all_vlines = []
+    t_lim = (0, 5)
+    f_lim = (None, None)
+    for combo in itertools.product(*[vals for _, vals in axes]):
+        run_args = copy.copy(args)
+        run_args.sweep = None
+        lbl_parts = []
+        for p, v in zip(params, combo):
+            setattr(run_args, p, v)
+            if special_sweep:
+                lbl_parts.append(_sym_label(p, v))
+            else:
+                vtxt = f"{v:g}" if isinstance(v, float) else str(v)
+                lbl_parts.append(f"{p}={vtxt}")
+        label = ", ".join(lbl_parts)
+        print(f"  [sweep point] {label}")
+        res = MODELS[name](run_args)
+        if not isinstance(res, SimResult) or isinstance(res, SweepResult):
+            raise TypeError(
+                f"Model {name!r} does not return a plain SimResult; aggregate "
+                "sweeping is only supported for single-realisation models. "
+                "Run it without aggregation (it already sweeps internally).")
+        entries.append(_simresult_to_entry(res, label))
+        all_vlines.append(tuple(res.vlines))
+        t_lim, f_lim = res.t_lim, res.f_lim
+
+    # Only keep guide lines that stay fixed across the sweep; a line marking a
+    # swept peak moves per point and doesn't make sense as a single line.
+    vlines = _constant_vlines(all_vlines)
+
+    last = entries[-1]
+    sweep_desc = " x ".join(params)
+    if damping_sweep:
+        legend_title = r"$\zeta$"
+    elif freq_sweep:
+        legend_title = r"$f$"
+    else:
+        legend_title = sweep_desc
+    # Cross-spectrum panel: honour the CLI flag when given; otherwise default
+    # to on except for damping/frequency sweeps (which drop it for clarity).
+    cli_show_cross = getattr(args, "show_cross", None)
+    show_cross = (not special_sweep) if cli_show_cross is None else cli_show_cross
+    swres = SweepResult(
+        entries=entries, lc1=last['lc1'], lc2=last['lc2'],
+        vlines=vlines, t_lim=t_lim, f_lim=f_lim,
+        lag_ylim=(np.min([np.nanmin(r['lag']) for r in entries]),
+                  np.max([np.nanmax(r['lag']) for r in entries])),
+        coh_ylim=(0.0, 1.02),
+        title=f"{name}: sweep over {sweep_desc}",
+        legend_title=legend_title,
+        show_cross=show_cross,
+        fixed_bands=fixed_bands)
+
+    os.makedirs(args.outdir, exist_ok=True)
+    tag = "sweep_" + "_".join(params)
+    base = os.path.join(args.outdir, f"{base_name}_{name}_{tag}"
+                        if base_name else f"{name}_{tag}")
+    plot_lightcurves(swres, f"{base}_lightcurve.{args.ext}")
+    plot_crossspectral_sweep(swres, f"{base}_crossspectral.{args.ext}", args)
+
+
+def _parse_sweeps(sweep_flags):
+    """['dampen2=0.05,0.1', 'omega2=5,6'] -> [('dampen2',[..]), ('omega2',[..])].
+
+    Values are parsed as float when possible, else kept as str.
+    """
+    def _coerce(s):
+        try:
+            return float(s)
+        except ValueError:
+            return s
+    axes = []
+    for spec in sweep_flags:
+        if "=" not in spec:
+            raise ValueError(f"--sweep expects PARAM=v1,v2,..., got {spec!r}")
+        param, vals = spec.split("=", 1)
+        axes.append((param.strip(),
+                     [_coerce(v.strip()) for v in vals.split(",") if v.strip()]))
+    return axes
+
+
+def _fmt_val(v):
+    """Filesystem-safe tag for a swept value."""
+    s = f"{v:g}" if isinstance(v, float) else str(v)
+    return s.replace(".", "p").replace("-", "m").replace("/", "_")
 
 
 def main():
+    import copy
+    import itertools
+
     args = build_parser().parse_args()
     if args.seed is not None:
         np.random.seed(args.seed)
 
     targets = list(MODELS) if args.model == "all" else [args.model]
+
+    if not args.sweep:
+        for name in targets:
+            run_one(name, args)
+        return
+
+    # Parameter sweep: Cartesian product over all --sweep axes.
+    axes = _parse_sweeps(args.sweep)
+    params = [p for p, _ in axes]
+    for p in params:
+        if not hasattr(args, p):
+            raise ValueError(f"--sweep parameter {p!r} is not a known CLI argument.")
+    base_name = args.name
+
     for name in targets:
-        run_one(name, args)
+        print(f"[{name}] sweeping {' x '.join(params)}")
+        try:
+            # Single-realisation models -> aggregate into ONE figure.
+            _run_aggregated_sweep(name, args, axes, base_name)
+        except TypeError as err:
+            # Models that already return a SweepResult can't be folded onto a
+            # single figure this way; fall back to one figure set per combo.
+            print(f"  (note: {err})")
+            print(f"  -> falling back to per-point figures for {name!r}")
+            for combo in itertools.product(*[vals for _, vals in axes]):
+                run_args = copy.copy(args)
+                run_args.sweep = None
+                tag_parts = []
+                for p, v in zip(params, combo):
+                    setattr(run_args, p, v)
+                    tag_parts.append(f"{p}{_fmt_val(v)}")
+                tag = "_".join(tag_parts)
+                run_args.name = f"{base_name}_{tag}" if base_name else tag
+                print(f"  === sweep point: {tag} ===")
+                run_one(name, run_args)
 
 
 if __name__ == "__main__":
