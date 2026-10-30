@@ -30,6 +30,10 @@ Bispectrum maps use bispec_sims.compute_bispec (stingray, Hann-tapered
 segments). Side biphases are measured with the same segments and taper, with
 bootstrap errors over segments; they are checked against the stingray maps.
 
+Outputs per model: {name}_side_biphase, {name}_fourier (PSDs, cross spectrum,
+lag, coherence), {name}_bicoherence_maps, {name}_biphase_maps,
+{name}_bicoherence_slices and {name}_report.pdf (see bispec_report.py).
+
 Example
 -------
     python bispec_biphase.py fm_response --outdir figures/biphase
@@ -154,7 +158,7 @@ def _fit_tau(f1, sides):
           f"{np.degrees(1 / np.sqrt(np.sum(w))):.1f} deg (pred 90)")
 
 
-MODELS = {"fm_response": (model_fm_response, r"$\tau_r$ (s)")}
+MODELS = {"fm_response": (model_fm_response, r"$\tau_r$")}
 
 
 # =========================================================================
@@ -217,13 +221,16 @@ def _wrap_near(phi, ref):
 # Plots
 # =========================================================================
 
-def plot_side_biphase(results, sweep_label, savepath, f_lim):
+def plot_side_biphase(results, sweep_label, savepath, f_lim, scale="log"):
     """Top: lower (open) and upper (filled) side biphase vs f1 with predictions.
     Middle: mean of the two (symmetric part).  Bottom: half difference."""
     fig, axes = qs._setup_xspec_axes(figsize=(7, 8.5), nrows=3)
     ax1, ax2, ax3 = axes
     colours = plt.cm.viridis(np.linspace(0.1, 0.85, len(results)))
-    nu = np.logspace(np.log10(f_lim[0]), np.log10(f_lim[1]), 300)
+    if scale == "linear":
+        for ax in axes:
+            ax.set_xscale("linear")
+    nu = np.linspace(f_lim[0], f_lim[1], 300)
     for res, col in zip(results, colours):
         f1, sides, pred = res["f1"], res["sides"], res["pred"]
         lo_p, up_p = pred(nu)
@@ -269,10 +276,14 @@ def plot_side_biphase(results, sweep_label, savepath, f_lim):
     ], fontsize=8, loc="lower right")
     ax3.set_xlabel(r"$f_1$ (Hz)")
     from matplotlib.ticker import FixedLocator, NullFormatter, ScalarFormatter
-    ticks = [t for t in (0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0) if f_lim[0] <= t <= f_lim[1]]
-    ax3.xaxis.set_major_locator(FixedLocator(ticks))
-    ax3.xaxis.set_major_formatter(ScalarFormatter())
-    ax3.xaxis.set_minor_formatter(NullFormatter())
+    if scale == "linear":
+        ticks = []
+    else:
+        ticks = [t for t in (0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0) if f_lim[0] <= t <= f_lim[1]]
+    if ticks:
+        ax3.xaxis.set_major_locator(FixedLocator(ticks))
+        ax3.xaxis.set_major_formatter(ScalarFormatter())
+        ax3.xaxis.set_minor_formatter(NullFormatter())
     axes[0].set_xlim(*f_lim)
     fig.align_ylabels(axes)
     fig.savefig(savepath, dpi=150, bbox_inches="tight")
@@ -290,11 +301,16 @@ def run(name, args):
     print(f"[{name}] {args.nseg} segments of {args.segment:g} s, dt = {args.dt:g} s")
     cases = fn(args, rng)
 
+    import bispec_report as rep
     f1_edges = np.geomspace(args.f1_min, args.f1_max, args.n_f1 + 1)
-    results, sets = [], []
+    results, sets, sums = [], [], []
+    spec_lim = (0.1, 8.0)
     for c in cases:
         lc1, lc2 = to_lc(c["x1"], args.dt, rng=rng, poisson=args.poisson), \
             to_lc(c["x2"], args.dt, rng=rng, poisson=args.poisson)
+        sums.append(rep.summarise_case(lc1, lc2, args.segment, c["label"],
+                                       intrinsic=args.poisson, scale=args.freq_scale,
+                                       f_max=spec_lim[1] * 1.5))
         X, freq = segment_ffts(lc1, args.segment, args.window)
         f1, sides = side_biphase(X, freq, f1_edges, FWHM / 2, rng=rng)
         results.append(dict(label=c["label"], f1=f1, sides=sides, pred=c["pred"]))
@@ -315,15 +331,17 @@ def run(name, args):
             m1 = to_lc(c["x1"][:nm], args.dt, rng=rng, poisson=args.poisson)
             m2 = to_lc(c["x2"][:nm], args.dt, rng=rng, poisson=args.poisson)
             bs = bsm.compute_bispec(m1, m2, args.dt, args.segment, args.window,
-                                    label=f"{c['sweep']:g}")
+                                    label=c["label"])
             Xm, fm = segment_ffts(m1, args.segment, args.window)
             _, sm = side_biphase(Xm, fm, f1_edges, FWHM / 2, n_boot=2, rng=rng)
             bs.check_phase = sm["upper"]["phase"][0]
             sets.append(bs)
 
     f_lim = (args.f1_min, args.f1_max)
-    plot_side_biphase(results, sweep_label, os.path.join(args.outdir, f"{name}_side_biphase.{args.ext}"),
-                      f_lim)
+    side_png = os.path.join(args.outdir, f"{name}_side_biphase.{args.ext}")
+    plot_side_biphase(results, sweep_label, side_png, f_lim, scale=args.freq_scale)
+    rep.plot_fourier(sums, os.path.join(args.outdir, f"{name}_fourier.{args.ext}"),
+                     spec_lim, (F0,), legend_title=sweep_label, scale=args.freq_scale)
 
     if args.maps:
         grid = bsm.LogGrid(sets[0].freq, args.rebin)
@@ -335,12 +353,14 @@ def run(name, args):
         for phase, tag in ((False, "bicoherence"), (True, "biphase")):
             bsm.plot_maps([sets[i] for i in keep], grid, null,
                           os.path.join(args.outdir, f"{name}_{tag}_maps.{args.ext}"),
-                          map_lim, (F0,), col_labels=labels, phase=phase)
+                          map_lim, (F0,), col_labels=labels, phase=phase,
+                          scale=args.freq_scale)
         # f1 band slice across the QPO, from the stingray estimator
         f_ref = np.sqrt(args.f1_min * args.f1_max)
         bsm.plot_slices([sets[i] for i in keep], grid, null,
                         os.path.join(args.outdir, f"{name}_bicoherence_slices.{args.ext}"),
-                        (0.1, 4.0), (F0,), f_ref, 2.0, legend_title=sweep_label)
+                        (0.1, 4.0), (F0,), f_ref, 2.0, legend_title=sweep_label,
+                        scale=args.freq_scale)
         # consistency check: stingray vs segment estimator, upper side, first f1 bin
         for bs, res in zip(sets, results):
             fr = bs.freq
@@ -349,6 +369,11 @@ def run(name, args):
             ph = np.angle(bs.bispec["11"][np.ix_(i1, j)].sum())
             d = np.degrees(np.angle(np.exp(1j * (ph - bs.check_phase))))
             print(f"  stingray vs segment estimator ({res['label']}): {d:+.2f} deg")
+        if args.report:
+            rep.write_report(os.path.join(args.outdir, f"{name}_report.pdf"), name, sums,
+                             sets, grid, null, spec_lim, map_lim, (F0,),
+                             legend_title=sweep_label, scale=args.freq_scale,
+                             summary_png=side_png if args.ext == "png" else None)
 
 
 def build_parser():
@@ -379,16 +404,23 @@ def build_parser():
                         "(f1, f0 - f1, f0) is dominated by the flux leg at f0 - f1.")
     p.add_argument("--n_f1", type=int, default=4)
     # maps
-    p.add_argument("--no-maps", dest="maps", action="store_false")
+    p.add_argument("--no-maps", dest="maps", action="store_false",
+                   help="Skip the stingray maps (and with them the report).")
+    p.add_argument("--no-report", dest="report", action="store_false",
+                   help="Skip the per-model PDF report ({name}_report.pdf).")
     p.add_argument("--map-nseg", type=int, default=256, dest="map_nseg",
                    help="Segments used for the 2D maps (the side biphases use all).")
-    p.add_argument("--rebin", type=float, default=0.05)
+    p.add_argument("--freq-scale", default="log", choices=["log", "linear"],
+                   dest="freq_scale", help="Frequency axes of all figures (linear maps start at 0 Hz).")
+    p.add_argument("--rebin", type=float, default=None,
+                   help="Log cell width for the maps; default 0.05 (log axes) or 0 (linear).")
     p.add_argument("--max-cols", type=int, default=6, dest="max_cols")
     return p
 
 
 def main():
     args = build_parser().parse_args()
+    bsm.set_default_rebin(args)
     os.makedirs(args.outdir, exist_ok=True)
     for m in args.models:
         run(m, args)

@@ -26,8 +26,10 @@ per 1/512 s bin) passes this null test at the nominal 1% rate.
 
 Each run produces two figures:
 
-    {name}_bicoherence_maps.{ext}     2D log10 b^2 (and biphase above the null)
-    {name}_biphase_maps.{ext}         sweeps only: 2D biphase above the null
+    {name}_bicoherence_maps.{ext}     2D log10 b^2 (and biphase)
+    {name}_biphase_maps.{ext}         sweeps only: 2D biphase
+    {name}_fourier.{ext}              PSDs, cross spectrum, phase lag, coherence
+    {name}_report.pdf                 per-model report (see bispec_report.py)
     {name}_bicoherence_slices.{ext}   b^2 along f1 = f2 and in a band of f2 around f_ref,
                                       plus the biphase in that band
 
@@ -338,9 +340,13 @@ def _guides(ax, f_guides, f_lim):
     ax.plot(f_lim, f_lim, color="0.6", ls=":", lw=0.8)
 
 
-def _style_map_ax(ax, f_lim, left, bottom):
-    ax.set_xscale("log")
-    ax.set_yscale("log")
+def _style_map_ax(ax, f_lim, left, bottom, scale="log"):
+    ax.set_xscale(scale)
+    ax.set_yscale(scale)
+    if scale == "linear":
+        from matplotlib.ticker import MaxNLocator
+        # prune the last tick so labels of adjacent panels do not run together
+        ax.xaxis.set_major_locator(MaxNLocator(5, steps=[1, 2, 5, 10], prune="upper"))
     ax.set_xlim(*f_lim)
     ax.set_ylim(*f_lim)
     ax.set_aspect("equal")
@@ -354,62 +360,94 @@ def _style_map_ax(ax, f_lim, left, bottom):
         ax.tick_params(labelleft=False)
 
 
-def plot_maps(sets, grid, null, savepath, f_lim, f_guides, col_labels=None,
-              vmin=-2.5, vmax=0.0, phase=False):
-    """Grid of cell-averaged log10 b^2 or biphase maps.
-
-    One BispecSet -> 2 rows (b^2, biphase where b^2 > 99% null) x 3 channels.
-    Several (a sweep) -> 3 rows (channels) x N sweep points, showing b^2, or
-    the biphase where b^2 > 99% null if `phase` is True.
-    In b^2 maps, cells above the 99% null threshold are outlined in white; in
-    biphase maps, cells below it are grey.
-    """
-    single = len(sets) == 1
-    nrows, ncols = (2, 3) if single else (3, len(sets))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols + 1.2, 3.2 * nrows),
-                             squeeze=False, gridspec_kw=dict(wspace=0.06, hspace=0.06))
-    e = grid.edges
+def _map_cmaps():
     cmap = plt.get_cmap("viridis").copy()
     cmap.set_bad("white")
     pcmap = plt.get_cmap("twilight").copy()
     pcmap.set_bad("0.55")   # distinct from the light +/-pi ends of twilight
+    return cmap, pcmap
+
+
+def draw_map_panel(ax, bs, key, grid, null, f_lim, f_guides, phase=False,
+                   mask_phase=False, scale="log", vmin=-2.5, vmax=0.0,
+                   left=True, bottom=True, text=""):
+    """Draw one log10 b^2 (or biphase) map of channel `key` into `ax`.
+
+    Returns the image for a colorbar. f_lim should already start at 0 for
+    linear axes (see plot_maps).
+    """
+    cmap, pcmap = _map_cmaps()
+    e = grid.edges
+    b2, _ = grid.b2(bs.b2[key])
+    sig = b2 > null.threshold
+    if phase:
+        ph = grid.phase(bs.bispec[key])
+        if mask_phase:
+            ph = np.where(sig, ph, np.nan)
+        im = ax.pcolormesh(e, e, ph.T, cmap=pcmap, vmin=-np.pi, vmax=np.pi,
+                           rasterized=True)
+    else:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            lb = np.log10(b2)
+        im = ax.pcolormesh(e, e, lb.T, cmap=cmap, vmin=vmin, vmax=vmax,
+                           rasterized=True)
+        if sig.any():
+            ax.contour(grid.centre, grid.centre, sig.T.astype(float),
+                       levels=[0.5], colors="white", linewidths=0.7)
+    _style_map_ax(ax, f_lim, left=left, bottom=bottom, scale=scale)
+    _guides(ax, f_guides, f_lim)
+    if text:
+        ax.text(0.04, 0.96, text, transform=ax.transAxes, va="top", ha="left",
+                fontsize=7, color="white",
+                bbox=dict(fc="black", alpha=0.45, lw=0, pad=2))
+    return im
+
+
+def phase_colorbar(fig, im, axes, mask_phase=False, **kw):
+    cb = fig.colorbar(im, ax=axes, label=r"Biphase (rad), $b^2 >$ 99% null"
+                      if mask_phase else "Biphase (rad)", **kw)
+    cb.set_ticks(_PI_TICKS[0])
+    cb.set_ticklabels(_PI_TICKS[1])
+    return cb
+
+
+def plot_maps(sets, grid, null, savepath, f_lim, f_guides, col_labels=None,
+              vmin=-2.5, vmax=0.0, phase=False, mask_phase=False, scale="log"):
+    """Grid of cell-averaged log10 b^2 or biphase maps.
+
+    One BispecSet -> 2 rows (b^2, biphase) x 3 channels.
+    Several (a sweep) -> 3 rows (channels) x N sweep points, showing b^2, or
+    the biphase if `phase` is True.
+    In b^2 maps, cells above the 99% null threshold are outlined in white.
+    Biphase maps show every cell; with mask_phase=True, cells below the null
+    are greyed out instead. scale = "log" or "linear" sets both frequency
+    axes; linear axes start at 0 Hz.
+    """
+    if scale == "linear":
+        f_lim = (0.0, f_lim[1])
+    single = len(sets) == 1
+    nrows, ncols = (2, 3) if single else (3, len(sets))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols + 1.2, 3.2 * nrows),
+                             squeeze=False, gridspec_kw=dict(wspace=0.06, hspace=0.06))
     im_b = im_p = None
     for c in range(ncols):
         for r in range(nrows):
-            ax = axes[r, c]
             if single:
                 bs, (key, name) = sets[0], _CHANNELS[c]
                 show_phase = r == 1
+                txt = name if r == 0 else ""
             else:
                 bs, (key, name) = sets[c], _CHANNELS[r]
                 show_phase = phase
-
-            b2, _ = grid.b2(bs.b2[key])
-            sig = b2 > null.threshold
-            if show_phase:
-                ph = np.where(sig, grid.phase(bs.bispec[key]), np.nan)
-                im_p = ax.pcolormesh(e, e, ph.T, cmap=pcmap, vmin=-np.pi,
-                                     vmax=np.pi, rasterized=True)
-            else:
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    lb = np.log10(b2)
-                im_b = ax.pcolormesh(e, e, lb.T, cmap=cmap, vmin=vmin, vmax=vmax,
-                                     rasterized=True)
-                if sig.any():
-                    ax.contour(grid.centre, grid.centre, sig.T.astype(float),
-                               levels=[0.5], colors="white", linewidths=0.7)
-            _style_map_ax(ax, f_lim, left=(c == 0), bottom=(r == nrows - 1))
-            _guides(ax, f_guides, f_lim)
-
-            txt = ""
-            if single and r == 0:
-                txt = name
-            elif not single:
                 txt = name if r else f"{name}\n{col_labels[c]}"
-            if txt:
-                ax.text(0.04, 0.96, txt, transform=ax.transAxes, va="top",
-                        ha="left", fontsize=7, color="white",
-                        bbox=dict(fc="black", alpha=0.45, lw=0, pad=2))
+            im = draw_map_panel(axes[r, c], bs, key, grid, null, f_lim, f_guides,
+                                phase=show_phase, mask_phase=mask_phase, scale=scale,
+                                vmin=vmin, vmax=vmax, left=(c == 0),
+                                bottom=(r == nrows - 1), text=txt)
+            if show_phase:
+                im_p = im
+            else:
+                im_b = im
 
     if im_b is not None:
         b_axes = axes[0, :] if single else axes.ravel()
@@ -417,10 +455,7 @@ def plot_maps(sets, grid, null, savepath, f_lim, f_guides, col_labels=None,
                      shrink=0.9, pad=0.02)
     if im_p is not None:
         p_axes = axes[1, :] if single else axes.ravel()
-        cb = fig.colorbar(im_p, ax=p_axes.tolist(), shrink=0.9, pad=0.02,
-                          label=r"Biphase (rad), $b^2 >$ 99% null")
-        cb.set_ticks(_PI_TICKS[0])
-        cb.set_ticklabels(_PI_TICKS[1])
+        phase_colorbar(fig, im_p, p_axes.tolist(), mask_phase, shrink=0.9, pad=0.02)
 
     fig.savefig(savepath, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -428,7 +463,7 @@ def plot_maps(sets, grid, null, savepath, f_lim, f_guides, col_labels=None,
 
 
 def plot_slices(sets, grid, null, savepath, f_lim, f_guides, f_ref, q_ref,
-                legend_title=None):
+                legend_title=None, scale="log"):
     """Stacked panels on a shared log-frequency axis (qpo_sims layout):
     b^2(f, f) / b^2(f, f2 in band) / biphase(f, f2 in band).
 
@@ -442,6 +477,10 @@ def plot_slices(sets, grid, null, savepath, f_lim, f_guides, f_ref, q_ref,
     """
     fig, axes = qs._setup_xspec_axes(figsize=(7, 8.5), nrows=3)
     ax1, ax2, ax3 = axes
+    if scale == "linear":
+        for ax in axes:
+            ax.set_xscale("linear")
+        f_lim = (0.0, f_lim[1])
     single = len(sets) == 1
     f = grid.centre
     diag = np.arange(grid.nb)
@@ -538,18 +577,24 @@ def run(name, args):
     f_lim = (max(f_lim[0], 0.5 / args.segment), min(f_lim[1], 0.5 / args.dt))
     f_guides = tuple(v for v in res.vlines if v is not None) or (spec.guides or ())
 
+    import bispec_report as rep
+    summ = dict(segment=args.segment, intrinsic=True, scale=args.freq_scale,
+                f_max=f_lim[1] * 1.5)
     if isinstance(res, qs.SweepResult):
-        sets = []
+        sets, sums = [], []
         legend_title = res.legend_title
         while res.entries:
             e = res.entries.pop(0)
+            lab = _sweep_label(e)
             sets.append(compute_bispec(e["lc1"], e["lc2"], args.dt, args.segment,
-                                       args.window, label=_sweep_label(e)))
+                                       args.window, label=lab))
+            sums.append(rep.summarise_case(e["lc1"], e["lc2"], label=lab, **summ))
             del e
             gc.collect()
     else:
         sets = [compute_bispec(res.lc1, res.lc2, args.dt, args.segment,
                                args.window)]
+        sums = [rep.summarise_case(res.lc1, res.lc2, label="", **summ)]
         legend_title = None
     del res
     gc.collect()
@@ -578,16 +623,24 @@ def run(name, args):
         keep = _subsample(len(sets), args.max_cols)
         plot_maps([sets[i] for i in keep], grid, null,
                   f"{base}_bicoherence_maps.{args.ext}", f_lim, f_guides,
-                  col_labels=[f"{legend_title} = {sets[i].label}" for i in keep])
+                  col_labels=[f"{legend_title} = {sets[i].label}" for i in keep],
+                  scale=args.freq_scale)
         plot_maps([sets[i] for i in keep], grid, null,
                   f"{base}_biphase_maps.{args.ext}", f_lim, f_guides,
                   col_labels=[f"{legend_title} = {sets[i].label}" for i in keep],
-                  phase=True)
+                  phase=True, scale=args.freq_scale)
     else:
         plot_maps(sets, grid, null, f"{base}_bicoherence_maps.{args.ext}",
-                  f_lim, f_guides)
+                  f_lim, f_guides, scale=args.freq_scale)
     plot_slices(sets, grid, null, f"{base}_bicoherence_slices.{args.ext}", f_lim,
-                f_guides, spec.f_ref, spec.q_ref, legend_title=legend_title)
+                f_guides, spec.f_ref, spec.q_ref, legend_title=legend_title,
+                scale=args.freq_scale)
+    rep.plot_fourier(sums, f"{base}_fourier.{args.ext}", f_lim, f_guides,
+                     legend_title=legend_title, scale=args.freq_scale)
+    if args.report:
+        rep.write_report(f"{base}_report.pdf", name, sums, sets, grid, null, f_lim,
+                         f_lim, f_guides, legend_title=legend_title,
+                         scale=args.freq_scale)
 
     if args.save_npz:
         np.savez_compressed(
@@ -615,20 +668,34 @@ def build_parser():
                    help="Segment length in s (default 16, as in the paper).")
     p.add_argument("--window", default="hann", choices=["hann", "none"],
                    help="Per-segment taper (default hann; see _segments).")
-    p.add_argument("--rebin", type=float, default=0.05,
+    p.add_argument("--freq-scale", default="log", choices=["log", "linear"],
+                   dest="freq_scale",
+                   help="Frequency axes of the maps and slices (default log; "
+                        "linear axes start at 0 Hz).")
+    p.add_argument("--rebin", type=float, default=None,
                    help="Fractional width of the log frequency cells used for "
-                        "plotting (default 0.05; 0 = native resolution).")
+                        "plotting (0 = native resolution). Default 0.05 with "
+                        "--freq-scale log and 0 with --freq-scale linear.")
     p.add_argument("--max-cols", type=int, default=6, dest="max_cols",
                    help="Max sweep points shown in the 2D map figure (all points "
                         "are always shown in the slice figure).")
+    p.add_argument("--no-report", dest="report", action="store_false",
+                   help="Skip the per-model PDF report ({name}_report.pdf).")
     p.add_argument("--save-npz", action="store_true", dest="save_npz",
                    help="Also save native-resolution b^2 and complex bispectra "
                         "to {name}_bispec.npz.")
     return p
 
 
+def set_default_rebin(args):
+    """Log cells for log axes, native (equal-width) bins for linear axes."""
+    if args.rebin is None:
+        args.rebin = 0.05 if args.freq_scale == "log" else 0.0
+
+
 def main():
     args = build_parser().parse_args()
+    set_default_rebin(args)
     os.makedirs(args.outdir, exist_ok=True)
     names = list(PAPER_RUNS) if "all" in args.runs else args.runs
     for name in names:

@@ -66,7 +66,7 @@ and the resulting leakage produces spurious bicoherence (try `--window none`). S
 on white-noise light curves with identical segmenting and taper. No Poisson correction is applied;
 Poisson white noise at these count rates passes the null test at ~1%.
 
-Each run writes `{name}_bicoherence_maps.png` (2D log10 b^2, biphase above the null; for the
+Each run writes `{name}_bicoherence_maps.png` (2D log10 b^2 and biphase; for the
 rms/depth sweeps the biphase goes in a separate `{name}_biphase_maps.png`) and
 `{name}_bicoherence_slices.png` (b^2(f, f), and b^2 and biphase in a QPO-width band of f2 around the
 reference frequency). Runs map onto the paper figures as follows:
@@ -88,3 +88,24 @@ python bispec_sims.py count_rate_fm        # Fig. 12
 
 or `python bispec_sims.py all` (~10 min, ~0.7 GB peak). Other options: `--dt`, `--segment`,
 `--rebin` (0 = native resolution), `--max-cols`, `--ext pdf`, `--save-npz`.
+
+Each run also writes `{name}_fourier.png` (power spectra, cross spectrum, phase lag and
+coherence, all cases overlaid) and a multi-page `{name}_report.pdf`: an overview page, then
+one page per case with the light curves, dynamical power spectra of both bands, the
+second-order Fourier products, and the band-1 and cross bicoherence and biphase maps
+(`bispec_report.py`; skip with `--no-report`). `--freq-scale linear` switches every
+frequency axis to linear (maps then use native, equal-width bins by default).
+
+## Biphase models
+
+`bispec_biphase.py` simulates couplings between a flux component and a QPO that give
+structured biphases on either side of the QPO, and compares them with the sideband
+predictions in `biphase_models.md`:
+
+```
+python bispec_biphase.py fm_response --outdir figures/biphase
+```
+
+It writes the same Fourier, map, slice and report outputs as above, plus
+`{name}_side_biphase.png`, the measured lower- and upper-side biphases against f1 with the
+predictions.
