@@ -47,3 +47,44 @@ simply run the following command:
 mkdir -p figures
 python qpo_sims.py all
 ```
+
+## Bispectra
+
+`bispec_sims.py` runs every model above with its paper defaults and computes bispectral
+diagnostics with the stingray bispectrum implementation (main branch, direct Fourier estimator):
+the band 1 and band 2 bispectra and the cross-bispectrum X1(f1) X1(f2) X2*(f1+f2). Stingray must be
+installed from main:
+
+```
+pip install "git+https://github.com/StingraySoftware/stingray.git@main"
+```
+
+Light curves are rebinned to 1/64 s and split into 16 s Hann-tapered segments (64 segments). The
+taper is needed: above a high-Q QPO the PSD falls faster than the sidelobes of a rectangular window,
+and the resulting leakage produces spurious bicoherence (try `--window none`). Squared bicoherence
+(Kim & Powers) is averaged over 5% log-frequency cells and compared with a 99% threshold calibrated
+on white-noise light curves with identical segmenting and taper. No Poisson correction is applied;
+Poisson white noise at these count rates passes the null test at ~1%.
+
+Each run writes `{name}_bicoherence_maps.png` (2D log10 b^2, biphase above the null; for the
+rms/depth sweeps the biphase goes in a separate `{name}_biphase_maps.png`) and
+`{name}_bicoherence_slices.png` (b^2(f, f), and b^2 and biphase in a QPO-width band of f2 around the
+reference frequency). Runs map onto the paper figures as follows:
+
+```
+mkdir -p figures/bispec
+python bispec_sims.py damping              # Fig. 2
+python bispec_sims.py resonance            # Fig. 3
+python bispec_sims.py coherent_sum         # Fig. 4
+python bispec_sims.py hidden               # Fig. 5
+python bispec_sims.py multi_coherent       # Fig. 6
+python bispec_sims.py multi_incoherent     # Fig. 7
+python bispec_sims.py multi_multiplicative # Fig. 8
+python bispec_sims.py fm                   # Fig. 9
+python bispec_sims.py fm_phase             # Fig. 10
+python bispec_sims.py fm_offset            # Fig. 11
+python bispec_sims.py count_rate_fm        # Fig. 12
+```
+
+or `python bispec_sims.py all` (~10 min, ~0.7 GB peak). Other options: `--dt`, `--segment`,
+`--rebin` (0 = native resolution), `--max-cols`, `--ext pdf`, `--save-npz`.
